@@ -4,6 +4,7 @@ use futures::{
     sync::{mpsc, oneshot},
     Sink,
 };
+use futures_cpupool::CpuPool;
 use hyper::Response;
 use hyper::{service::service_fn, Body, Method, Request, Server, StatusCode};
 use hyper_staticfile::FileChunkStream;
@@ -21,13 +22,13 @@ lazy_static! {
 }
 fn main() {
     let directory = Path::new("./files");
-    let tx = start_worker();
+    let pool = CpuPool::new(4);
     fs::create_dir(directory).ok();
     let addr = ([127, 0, 0, 1], 8080).into();
     let builder = Server::bind(&addr);
     let server = builder.serve(move || {
-        let tx = tx.clone();
-        service_fn(move |req| handle_microservice(req, &directory, tx.clone()))
+        let pool = pool.clone();
+        service_fn(move |req| handle_microservice(req, &directory, pool.clone()))
     });
     let server = server.map_err(drop);
     hyper::rt::run(server);
@@ -78,12 +79,13 @@ fn to_number(value: &Value, default: u16) -> u16 {
 fn handle_microservice(
     req: Request<Body>,
     directory: &Path,
-    tx: mpsc::Sender<WorkerRequest>,
+    pool: CpuPool,
 ) -> Box<dyn Future<Item = Response<Body>, Error = Error> + Send> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => Box::new(future::ok(Response::new(INDEX.into()))),
         (&Method::POST, "/upload") => {
             let name: String = thread_rng().sample_iter(&Alphanumeric).take(20).collect();
+
             let mut directory_path = directory.to_path_buf();
             directory_path.push(&name);
             let create_file = File::create(directory_path);
@@ -109,18 +111,8 @@ fn handle_microservice(
                 .concat2()
                 .map(|chunk| chunk.to_vec())
                 .and_then(move |buffer| {
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    let resp_rx = resp_rx.map_err(other);
-                    let request = WorkerRequest {
-                        buffer,
-                        height,
-                        width,
-                        tx: resp_tx,
-                    };
-                    tx.send(request)
-                        .map_err(other)
-                        .and_then(move |_| resp_rx)
-                        .and_then(|x| x)
+                    let task = future::lazy(move || convert(buffer, 100, 200));
+                    pool.spawn(task).map_err(other)
                 })
                 .map(|resp| Response::new(resp.into()));
 
@@ -128,37 +120,31 @@ fn handle_microservice(
         }
         (&Method::GET, path) => {
             if let Some(cap) = DOWNLOAD_FILE.captures(path) {
+                let uri = req.uri().query().unwrap_or("");
+                let query = queryst::parse(uri).unwrap_or(Value::Null);
+                let height = to_number(&query["height"], 100);
+                let width = to_number(&query["width"], 200);
                 let filename = cap.name("filename").unwrap().as_str();
                 let mut directory_path = directory.to_path_buf();
                 directory_path.push(filename);
                 let open_file = File::open(directory_path);
-                let body = open_file.map(|file| {
-                    let stream = FileChunkStream::new(file);
-                    // let body = Body::wrap_stream(stream);
-                    let st = stream.concat2().wait().unwrap();
-                    let buffer = st.to_vec();
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    let resp_rx = resp_rx.map_err(other);
-                    let request = WorkerRequest {
-                        buffer,
-                        height: 100,
-                        width: 200,
-                        tx: resp_tx,
-                    };
-                    let body = tx
-                        .send(request)
-                        .map_err(other)
-                        .and_then(move |_| resp_rx)
-                        .and_then(|x| x)
-                        .map(|resp| Response::new(resp.into()));
-                    // let st = stream.into_future();
-                    // let res = st.and_then(move |buf| {
-                    //     let buffer = buf.0.unwrap().to_vec();
-                    //
-                    // });
+                let body = open_file
+                    .map(|file| {
+                        let stream = FileChunkStream::new(file);
+                        // let body = Body::wrap_stream(stream);
+                        let st = stream.concat2().wait().unwrap();
+                        let buffer = st.to_vec();
+                        let task = future::lazy(move || convert(buffer, width, height));
+                        let body = pool
+                            .spawn(task)
+                            .map_err(other)
+                            .map(|resp| Response::new(resp.into()));
 
-                    body
-                }).wait().ok().unwrap();
+                        body
+                    })
+                    .wait()
+                    .ok()
+                    .unwrap();
                 Box::new(body)
             // response_with_code(StatusCode::NOT_FOUND)
             } else {
