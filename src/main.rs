@@ -146,7 +146,6 @@ fn handle_microservice(
                     .ok()
                     .unwrap();
                 Box::new(body)
-            // response_with_code(StatusCode::NOT_FOUND)
             } else {
                 response_with_code(StatusCode::NOT_FOUND)
             }
