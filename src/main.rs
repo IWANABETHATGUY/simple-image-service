@@ -1,3 +1,4 @@
+use actix::{Actor, Addr};
 use futures::future::{self, Future};
 use futures::{
     stream::Stream,
@@ -16,23 +17,67 @@ use std::io::{Error, ErrorKind};
 use std::{fs, path::Path, thread};
 use tokio::fs::File;
 static INDEX: &[u8] = b"microservice Image";
+
+mod actor;
+
 lazy_static! {
     static ref DOWNLOAD_FILE: regex::Regex =
         regex::Regex::new("^/download/(?P<filename>\\w{20})?$").unwrap();
 }
-fn main() {
-    let directory = Path::new("./files");
-    let pool = CpuPool::new(4);
-    fs::create_dir(directory).ok();
-    let addr = ([127, 0, 0, 1], 8080).into();
-    let builder = Server::bind(&addr);
-    let server = builder.serve(move || {
-        let pool = pool.clone();
-        service_fn(move |req| handle_microservice(req, &directory, pool.clone()))
-    });
-    let server = server.map_err(drop);
-    hyper::rt::run(server);
+
+use self::actor::counter::{CountActor, Counter};
+#[derive(Clone)]
+struct State {
+    counter: Addr<CountActor>,
 }
+
+fn main() {
+    actix::run(|| {
+        let counter = CountActor::new().start();
+        let state = State { counter };
+        let addr = ([127, 0, 0, 1], 8080).into();
+        let builder = Server::bind(&addr);
+
+        let server = builder.serve(move || {
+            let state = state.clone();
+            service_fn(move |req| microservice(&state, req))
+        });
+        server.map_err(drop)
+    });
+    // let directory = Path::new("./files");
+    // let pool = CpuPool::new(4);
+    // fs::create_dir(directory).ok();
+    // let addr = ([127, 0, 0, 1], 8080).into();
+    // let builder = Server::bind(&addr);
+    // let server = builder.serve(move || {
+    //     let pool = pool.clone();
+    //     service_fn(move |req| handle_microservice(req, &directory, pool.clone()))
+    // });
+    // let server = server.map_err(drop);
+    // hyper::rt::run(server);
+}
+
+fn microservice(
+    state: &State,
+    req: Request<Body>,
+) -> Box<dyn Future<Item = Response<Body>, Error = failure::Error> + Send> {
+    let body = count_up(state, req.uri().path())
+        .and_then(move |value| {
+            let ret = format!("{}: {}", req.uri().path().to_string(), value);
+            Ok(Response::new(Body::from(ret.to_string())))
+        });
+
+    Box::new(body)
+}
+
+fn count_up(state: &State, path: &str) -> impl Future<Item = u64, Error = failure::Error> {
+    let path = path.to_string();
+    state
+        .counter
+        .send(Counter(path.clone()))
+        .map_err(|err| err.into())
+}
+
 type WorkerResponse = Result<Vec<u8>, Error>;
 struct WorkerRequest {
     height: u16,
@@ -76,86 +121,87 @@ fn to_number(value: &Value, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-fn handle_microservice(
-    req: Request<Body>,
-    directory: &Path,
-    pool: CpuPool,
-) -> Box<dyn Future<Item = Response<Body>, Error = Error> + Send> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/") => Box::new(future::ok(Response::new(INDEX.into()))),
-        (&Method::POST, "/upload") => {
-            let name: String = thread_rng().sample_iter(&Alphanumeric).take(20).collect();
+// TODO: 这里是原来的handler
+// fn handle_microservice(
+//     req: Request<Body>,
+//     directory: &Path,
+//     pool: CpuPool,
+// ) -> Box<dyn Future<Item = Response<Body>, Error = Error> + Send> {
+//     match (req.method(), req.uri().path()) {
+//         (&Method::GET, "/") => Box::new(future::ok(Response::new(INDEX.into()))),
+//         (&Method::POST, "/upload") => {
+//             let name: String = thread_rng().sample_iter(&Alphanumeric).take(20).collect();
 
-            let mut directory_path = directory.to_path_buf();
-            directory_path.push(&name);
-            let create_file = File::create(directory_path);
-            let write = create_file.and_then(|file| {
-                req.into_body().map_err(other).fold(file, |file, chunk| {
-                    tokio::io::write_all(file, chunk).map(|(file, _)| file)
-                })
-            });
-            let body = write.map(|_| Response::new(name.into()));
-            Box::new(body)
-        }
-        (&Method::POST, "/resize") => {
-            let (width, height) = {
-                let uri = req.uri().query().unwrap_or("");
-                let query = queryst::parse(uri).unwrap_or(Value::Null);
-                let w = to_number(&query["width"], 180);
-                let h = to_number(&query["height"], 180);
-                (w, h)
-            };
-            let body = req
-                .into_body()
-                .map_err(other)
-                .concat2()
-                .map(|chunk| chunk.to_vec())
-                .and_then(move |buffer| {
-                    let task = future::lazy(move || convert(buffer, 100, 200));
-                    pool.spawn(task).map_err(other)
-                })
-                .map(|resp| Response::new(resp.into()));
+//             let mut directory_path = directory.to_path_buf();
+//             directory_path.push(&name);
+//             let create_file = File::create(directory_path);
+//             let write = create_file.and_then(|file| {
+//                 req.into_body().map_err(other).fold(file, |file, chunk| {
+//                     tokio::io::write_all(file, chunk).map(|(file, _)| file)
+//                 })
+//             });
+//             let body = write.map(|_| Response::new(name.into()));
+//             Box::new(body)
+//         }
+//         (&Method::POST, "/resize") => {
+//             let (width, height) = {
+//                 let uri = req.uri().query().unwrap_or("");
+//                 let query = queryst::parse(uri).unwrap_or(Value::Null);
+//                 let w = to_number(&query["width"], 180);
+//                 let h = to_number(&query["height"], 180);
+//                 (w, h)
+//             };
+//             let body = req
+//                 .into_body()
+//                 .map_err(other)
+//                 .concat2()
+//                 .map(|chunk| chunk.to_vec())
+//                 .and_then(move |buffer| {
+//                     let task = future::lazy(move || convert(buffer, 100, 200));
+//                     pool.spawn(task).map_err(other)
+//                 })
+//                 .map(|resp| Response::new(resp.into()));
 
-            Box::new(body)
-        }
-        (&Method::GET, path) => {
-            if let Some(cap) = DOWNLOAD_FILE.captures(path) {
-                let uri = req.uri().query().unwrap_or("");
-                let query = queryst::parse(uri).unwrap_or(Value::Null);
-                let height = to_number(&query["height"], 100);
-                let width = to_number(&query["width"], 200);
-                let filename = cap.name("filename").unwrap().as_str();
-                let mut directory_path = directory.to_path_buf();
-                directory_path.push(filename);
-                let open_file = File::open(directory_path);
-                let body = open_file
-                    .map(|file| {
-                        let stream = FileChunkStream::new(file);
-                        // let body = Body::wrap_stream(stream);
-                        let st = stream.concat2().wait().unwrap();
-                        let buffer = st.to_vec();
-                        let task = future::lazy(move || convert(buffer, width, height));
-                        let body = pool
-                            .spawn(task)
-                            .map_err(other)
-                            .map(|resp| Response::new(resp.into()));
+//             Box::new(body)
+//         }
+//         (&Method::GET, path) => {
+//             if let Some(cap) = DOWNLOAD_FILE.captures(path) {
+//                 let uri = req.uri().query().unwrap_or("");
+//                 let query = queryst::parse(uri).unwrap_or(Value::Null);
+//                 let height = to_number(&query["height"], 100);
+//                 let width = to_number(&query["width"], 200);
+//                 let filename = cap.name("filename").unwrap().as_str();
+//                 let mut directory_path = directory.to_path_buf();
+//                 directory_path.push(filename);
+//                 let open_file = File::open(directory_path);
+//                 let body = open_file
+//                     .map(|file| {
+//                         let stream = FileChunkStream::new(file);
+//                         // let body = Body::wrap_stream(stream);
+//                         let st = stream.concat2().wait().unwrap();
+//                         let buffer = st.to_vec();
+//                         let task = future::lazy(move || convert(buffer, width, height));
+//                         let body = pool
+//                             .spawn(task)
+//                             .map_err(other)
+//                             .map(|resp| Response::new(resp.into()));
 
-                        body
-                    })
-                    .wait()
-                    .ok()
-                    .unwrap();
-                Box::new(body)
-            } else {
-                response_with_code(StatusCode::NOT_FOUND)
-            }
-        }
-        _ => response_with_code(StatusCode::NOT_FOUND),
-    }
-}
+//                         body
+//                     })
+//                     .wait()
+//                     .ok()
+//                     .unwrap();
+//                 Box::new(body)
+//             } else {
+//                 response_with_code(StatusCode::NOT_FOUND)
+//             }
+//         }
+//         _ => response_with_code(StatusCode::NOT_FOUND),
+//     }
+// }
 fn response_with_code(
     status_code: StatusCode,
-) -> Box<dyn Future<Item = Response<Body>, Error = Error> + Send> {
+) -> Box<dyn Future<Item = Response<Body>, Error = failure::Error> + Send> {
     let body = Response::builder()
         .status(status_code)
         .body(Body::empty())
