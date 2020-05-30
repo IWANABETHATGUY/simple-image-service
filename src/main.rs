@@ -93,6 +93,38 @@ fn microservice(
             });
             Box::new(fut)
         }
+        (&Method::GET, path) => {
+            if let Some(cap) = DOWNLOAD_FILE.captures(path) {
+                let uri = req.uri().query().unwrap_or("");
+                let query = queryst::parse(uri).unwrap_or(Value::Null);
+                let height = to_number(&query["height"], 100);
+                let width = to_number(&query["width"], 200);
+                let filename = cap.name("filename").unwrap().as_str();
+                let mut directory_path = directory.to_path_buf();
+                directory_path.push(filename);
+                let open_file = File::open(directory_path);
+                let body = open_file
+                    .map(|file| {
+                        let stream = FileChunkStream::new(file);
+                        // let body = Body::wrap_stream(stream);
+                        let st = stream.concat2().wait().unwrap();
+                        let buffer = st.to_vec();
+                        let task = future::lazy(move || convert(buffer, width, height));
+                        let body = pool
+                            .spawn(task)
+                            .map_err(other)
+                            .map(|resp| Response::new(resp.into()));
+
+                        body
+                    })
+                    .wait()
+                    .ok()
+                    .unwrap();
+                Box::new(body)
+            } else {
+                response_with_code(StatusCode::NOT_FOUND)
+            }
+        }
         _ => response_with_code(StatusCode::NOT_FOUND),
     }
 }
