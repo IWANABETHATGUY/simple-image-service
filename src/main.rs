@@ -1,7 +1,9 @@
 use actix::{Actor, Addr, SyncArbiter};
+use bytes::BytesMut;
 use failure::Fail;
 use futures::future::{self, Future};
 use futures::{stream::Stream, Sink};
+// use tokio_io::async_read::AsyncRead;
 
 use hyper::Response;
 use hyper::{service::service_fn, Body, Method, Request, Server, StatusCode};
@@ -11,7 +13,11 @@ use lazy_static::lazy_static;
 use serde_json::Value;
 use std::io::{Error, ErrorKind};
 use std::{fs, path::Path, thread};
-use tokio::fs::File;
+use tokio::{
+    codec::{BytesCodec, FramedRead},
+    fs::File,
+    io::AsyncRead,
+};
 static INDEX: &[u8] = b"microservice Image";
 
 mod actor;
@@ -26,6 +32,7 @@ use self::actor::{
     resize::ResizeActor,
 };
 use actor::resize::Resize;
+use hyper_staticfile::FileChunkStream;
 
 #[derive(Clone)]
 struct State {
@@ -34,7 +41,26 @@ struct State {
 }
 
 fn main() {
+    // let directory = Path::new("./files");
+    // let mut directory_path = directory.to_path_buf();
+    // directory_path.push("WvbHG941JzcKlix4WmbM");
+    // // let openfile = File::open(directory_path);
+    // let task = tokio::fs::File::open(directory_path)
+    //     .and_then(|mut file| {
+    //         println!("{:?}", file);
+    //         let mut contents = vec![];
+    //         file.read_buf(&mut contents).map(|res| {
+    //             contents
+    //         })
+    //     })
+    //     .map_err(|err| eprintln!("IO error: {:?}", err))
+    //     .and_then(|res| {
+    //         println!("{:?}", res);
+    //         future::ok(())
+    //     });
+    // tokio::run(task);
     actix::run(|| {
+        let directory = Path::new("./files");
         let resize = SyncArbiter::start(2, || ResizeActor);
         let counter = CountActor::new().start();
         let state = State { counter, resize };
@@ -43,7 +69,7 @@ fn main() {
 
         let server = builder.serve(move || {
             let state = state.clone();
-            service_fn(move |req| microservice(&state, req))
+            service_fn(move |req| microservice(&state, req, directory))
         });
         server.map_err(drop)
     });
@@ -52,7 +78,8 @@ fn main() {
 fn microservice(
     state: &State,
     req: Request<Body>,
-) -> Box<dyn Future<Item = Response<Body>, Error = Error> + Send> {
+    directory: &Path,
+) -> Box<dyn Future<Item = Response<Body>, Error = Error> + Send>  {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => {
             let future = count_up(state, req.uri().path()).map(|value| {
@@ -93,7 +120,7 @@ fn microservice(
             });
             Box::new(fut)
         }
-        (&Method::GET, path) => {
+        (&Method::GET, path) =>  {
             if let Some(cap) = DOWNLOAD_FILE.captures(path) {
                 let uri = req.uri().query().unwrap_or("");
                 let query = queryst::parse(uri).unwrap_or(Value::Null);
@@ -103,24 +130,37 @@ fn microservice(
                 let mut directory_path = directory.to_path_buf();
                 directory_path.push(filename);
                 let open_file = File::open(directory_path);
+                let resize = state.resize.clone();
+                // let file = 
                 let body = open_file
-                    .map(|file| {
-                        let stream = FileChunkStream::new(file);
-                        // let body = Body::wrap_stream(stream);
-                        let st = stream.concat2().wait().unwrap();
-                        let buffer = st.to_vec();
-                        let task = future::lazy(move || convert(buffer, width, height));
-                        let body = pool
-                            .spawn(task)
-                            .map_err(other)
-                            .map(|resp| Response::new(resp.into()));
-
-                        body
+                    .and_then(|file| {
+                        Ok(FramedRead::new(file, BytesCodec::new()).map(|b| b.freeze()))
                     })
-                    .wait()
-                    .ok()
-                    .unwrap();
+                    .flatten_stream()
+                    .and_then(|mut file| {
+                        let v: Vec<u8> = file.to_vec();
+                        Ok(v)
+                    })
+                    // .map_err(other)
+                    .and_then(move |buffer| {
+                        let msg = Resize {
+                            buffer,
+                            width,
+                            height,
+                        };
+                        resize
+                            .send(msg)
+                            .map_err(|err| other(err.compat()))
+                            .and_then(|x| x.map_err(other))
+                    })
+                    .map(|resp: Vec<u8>| Response::<Vec<u8>>::new(resp.into()));
+
+                // let fut = count_up(state, "/resize").map(move |value| {
+                //     println!("`/resize`: {:?}", value);
+                //     body
+                // });
                 Box::new(body)
+            // response_with_code(StatusCode::NOT_FOUND)
             } else {
                 response_with_code(StatusCode::NOT_FOUND)
             }

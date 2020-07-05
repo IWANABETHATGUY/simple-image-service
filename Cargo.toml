@@ -23,3 +23,5 @@ futures-cpupool = "0.1"
 actix = "0.7"
 failure = "0.1"
 syslog = "5.0"
+
+bytes = "0.5.4"
